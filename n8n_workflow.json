@@ -1,0 +1,206 @@
+{
+  "name": "Automated Weekly Sales Reporting Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * 1"
+            }
+          ]
+        }
+      },
+      "id": "e0a4e34c-53eb-48e5-8ee5-f2e60e9aaf72",
+      "name": "Every Monday 8AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -400,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- PART 1: Weekly revenue by region with week-over-week % change\nWITH weekly_revenue AS (\n    SELECT\n        c.region,\n        date_trunc('week', o.order_date)::date AS week_start,\n        SUM(oi.quantity * oi.unit_price)        AS revenue\n    FROM orders o\n    JOIN customers c        ON c.customer_id = o.customer_id\n    JOIN order_items oi     ON oi.order_id = o.order_id\n    WHERE o.status = 'completed'\n    GROUP BY c.region, date_trunc('week', o.order_date)\n)\nSELECT\n    region,\n    week_start,\n    ROUND(revenue, 2) AS revenue,\n    ROUND(\n        100.0 * (revenue - LAG(revenue) OVER (PARTITION BY region ORDER BY week_start))\n        / NULLIF(LAG(revenue) OVER (PARTITION BY region ORDER BY week_start), 0)\n    , 1) AS wow_pct_change\nFROM weekly_revenue\nORDER BY region, week_start;\n\n-- PART 2: Top 5 products by revenue, most recent completed week\nWITH latest_week AS (\n    SELECT date_trunc('week', MAX(order_date))::date AS week_start\n    FROM orders\n    WHERE status = 'completed'\n)\nSELECT\n    p.product_name,\n    p.category,\n    SUM(oi.quantity)                    AS units_sold,\n    ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue\nFROM orders o\nJOIN order_items oi ON oi.order_id = o.order_id\nJOIN products p     ON p.product_id = oi.product_id\nJOIN latest_week lw ON date_trunc('week', o.order_date)::date = lw.week_start\nWHERE o.status = 'completed'\nGROUP BY p.product_name, p.category\nORDER BY revenue DESC\nLIMIT 5;\n\n-- PART 3: Company-wide summary\nWITH latest_week AS (\n    SELECT date_trunc('week', MAX(order_date))::date AS week_start\n    FROM orders WHERE status = 'completed'\n),\nthis_week AS (\n    SELECT ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue,\n           COUNT(DISTINCT o.order_id) AS order_count\n    FROM orders o\n    JOIN order_items oi ON oi.order_id = o.order_id\n    JOIN latest_week lw ON date_trunc('week', o.order_date)::date = lw.week_start\n    WHERE o.status = 'completed'\n),\nprior_week AS (\n    SELECT ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue\n    FROM orders o\n    JOIN order_items oi ON oi.order_id = o.order_id\n    JOIN latest_week lw ON date_trunc('week', o.order_date)::date = lw.week_start - INTERVAL '7 days'\n    WHERE o.status = 'completed'\n)\nSELECT\n    tw.revenue                          AS this_week_revenue,\n    tw.order_count                      AS this_week_orders,\n    pw.revenue                          AS prior_week_revenue,\n    ROUND(100.0 * (tw.revenue - pw.revenue) / NULLIF(pw.revenue, 0), 1) AS wow_pct_change\nFROM this_week tw, prior_week pw;",
+        "options": {}
+      },
+      "id": "32a3d640-9ab1-424e-9676-cc61822a993d",
+      "name": "Run Reporting Query (Postgres)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -176,
+        176
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "kszGyZlfl66OuOF5",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Format the raw query result rows into a compact JSON payload\n// for the AI summarization step. Keeps the prompt small and structured.\nconst rows = $input.all().map(item => item.json);\nreturn [{ json: { report_data: rows, generated_at: new Date().toISOString() } }];"
+      },
+      "id": "89cf68e5-03c1-4707-b531-2f640722ba16",
+      "name": "Format Data for AI",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        48,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract the plain-text summary from Claude's response\nconst content = $input.first().json.content || [];\nconst text = (Array.isArray(content) ? content.find(c => c.type === 'text')?.text : null) || 'No summary generated.';\nreturn [{ json: { summary_text: text } }];"
+      },
+      "id": "b7f65bc4-de11-45fc-93c7-7fd6a392912c",
+      "name": "Extract Summary Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        624,
+        176
+      ]
+    },
+    {
+      "parameters": {
+        "authentication": "oAuth2",
+        "select": "channel",
+        "channelId": {
+          "__rl": true,
+          "value": "#weekly-sales-report",
+          "mode": "name"
+        },
+        "text": "=📊 *Weekly Sales Report — {{ $now.format('MMM dd, yyyy') }}*\n\n{{ $json.summary_text }}\n\n_Automated by the Reporting Pipeline — full dashboard in looker studio https://datastudio.google.com/reporting/2b9d1cdd-1739-4f4d-b187-b163c07f4641",
+        "otherOptions": {}
+      },
+      "id": "08bfd0d0-7c11-461b-b2b1-9d0aa9fe5e4f",
+      "name": "Post to Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [
+        816,
+        176
+      ],
+      "webhookId": "9fe6bc1f-cf2c-4f60-9b8d-a78bfacbd7e0",
+      "credentials": {
+        "slackOAuth2Api": {
+          "id": "U2fvuVOvnfyc2jKm",
+          "name": "Slack account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "claude-sonnet-4-6",
+          "mode": "list",
+          "cachedResultName": "claude-sonnet-4-6"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=You are a business analyst. Summarize this week's sales data in 3 short bullet points: overall revenue trend vs last week, the standout product, and any red flags. Be concise and use plain business language.\ndo not include asteriks.\nData:\n{{ JSON.stringify($json.report_data) }}"
+            }
+          ]
+        },
+        "options": {
+          "maxTokens": 4096
+        }
+      },
+      "id": "2fac873c-4adf-429f-89a2-5707c229cfbf",
+      "name": "report summary AI layer",
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
+      "position": [
+        272,
+        176
+      ],
+      "credentials": {
+        "anthropicApi": {
+          "id": null,
+          "name": "",
+          "__aiGatewayManaged": true
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Every Monday 8AM": {
+      "main": [
+        [
+          {
+            "node": "Run Reporting Query (Postgres)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run Reporting Query (Postgres)": {
+      "main": [
+        [
+          {
+            "node": "Format Data for AI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Data for AI": {
+      "main": [
+        [
+          {
+            "node": "report summary AI layer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Summary Text": {
+      "main": [
+        [
+          {
+            "node": "Post to Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "report summary AI layer": {
+      "main": [
+        [
+          {
+            "node": "Extract Summary Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "0206dac8-bf6e-4464-84a7-132d16a36f08",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "63f355e1e3d9ad557c016da6dec587895915b10f35aa934aae192fd2369442fd"
+  },
+  "nodeGroups": [],
+  "id": "nuKeh1E5umpw1IUy",
+  "tags": []
+}
